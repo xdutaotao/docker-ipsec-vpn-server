@@ -149,6 +149,8 @@ XAUTH_POOL=${VPN_XAUTH_POOL:-'192.168.43.10-192.168.43.250'}
 DNS_SRV1=${VPN_DNS_SRV1:-'8.8.8.8'}
 DNS_SRV2=${VPN_DNS_SRV2:-'8.8.4.4'}
 DNS_SRVS="\"$DNS_SRV1 $DNS_SRV2\""
+L2TP_ENCRYPT=${VPN_L2TP_ENCRYPT:-'Y'}
+
 [ -n "$VPN_DNS_SRV1" ] && [ -z "$VPN_DNS_SRV2" ] && DNS_SRVS="$DNS_SRV1"
 
 case $VPN_SHA2_TRUNCBUG in
@@ -160,8 +162,49 @@ case $VPN_SHA2_TRUNCBUG in
     ;;
 esac
 
-# Create IPsec (Libreswan) config
-cat > /etc/ipsec.conf <<EOF
+# Create xl2tpd config
+cat > /etc/xl2tpd/xl2tpd.conf <<EOF
+[global]
+port = 1701
+
+[lns default]
+ip range = $L2TP_POOL
+local ip = $L2TP_LOCAL
+require chap = yes
+refuse pap = yes
+require authentication = yes
+name = l2tpd
+pppoptfile = /etc/ppp/options.xl2tpd
+length bit = yes
+EOF
+
+# Set xl2tpd options
+cat > /etc/ppp/options.xl2tpd <<EOF
++mschap-v2
+ipcp-accept-local
+ipcp-accept-remote
+noccp
+auth
+mtu 1280
+mru 1280
+proxyarp
+lcp-echo-failure 4
+lcp-echo-interval 30
+connect-delay 5000
+ms-dns $DNS_SRV1
+EOF
+
+if [ -z "$VPN_DNS_SRV1" ] || [ -n "$VPN_DNS_SRV2" ]; then
+cat >> /etc/ppp/options.xl2tpd <<EOF
+ms-dns $DNS_SRV2
+EOF
+fi
+
+#=====================================
+# do not encrypt as default
+if [ "$L2TP_ENCRYPT" = "Y" ]; then
+	# Create IPsec (Libreswan) config
+	cat > /etc/ipsec.conf <<EOF
 version 2.0
 
 config setup
@@ -211,52 +254,18 @@ conn xauth-psk
   also=shared
 EOF
 
-if uname -r | grep -qi 'coreos'; then
-  sed -i '/phase2alg/s/,aes256-sha2_512//' /etc/ipsec.conf
-fi
+	if uname -r | grep -qi 'coreos'; then
+	  sed -i '/phase2alg/s/,aes256-sha2_512//' /etc/ipsec.conf
+	fi
 
-# Specify IPsec PSK
-cat > /etc/ipsec.secrets <<EOF
+	# Specify IPsec PSK
+	cat > /etc/ipsec.secrets <<EOF
 %any  %any  : PSK "$VPN_IPSEC_PSK"
 EOF
 
-# Create xl2tpd config
-cat > /etc/xl2tpd/xl2tpd.conf <<EOF
-[global]
-port = 1701
-
-[lns default]
-ip range = $L2TP_POOL
-local ip = $L2TP_LOCAL
-require chap = yes
-refuse pap = yes
-require authentication = yes
-name = l2tpd
-pppoptfile = /etc/ppp/options.xl2tpd
-length bit = yes
-EOF
-
-# Set xl2tpd options
-cat > /etc/ppp/options.xl2tpd <<EOF
-+mschap-v2
-ipcp-accept-local
-ipcp-accept-remote
-noccp
-auth
-mtu 1280
-mru 1280
-proxyarp
-lcp-echo-failure 4
-lcp-echo-interval 30
-connect-delay 5000
-ms-dns $DNS_SRV1
-EOF
-
-if [ -z "$VPN_DNS_SRV1" ] || [ -n "$VPN_DNS_SRV2" ]; then
-cat >> /etc/ppp/options.xl2tpd <<EOF
-ms-dns $DNS_SRV2
-EOF
 fi
+#end of encrypt
+#==================================================
 
 # Create VPN credentials
 cat > /etc/ppp/chap-secrets <<EOF
@@ -312,12 +321,21 @@ $SYST net.ipv4.conf.eth0.send_redirects=0
 $SYST net.ipv4.conf.eth0.rp_filter=0
 
 # Create IPTables rules
+if [ "$L2TP_ENCRYPT" = "Y" ]; then
 iptables -I INPUT 1 -p udp --dport 1701 -m policy --dir in --pol none -j DROP
 iptables -I INPUT 2 -m conntrack --ctstate INVALID -j DROP
 iptables -I INPUT 3 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -I INPUT 4 -p udp -m multiport --dports 500,4500 -j ACCEPT
 iptables -I INPUT 5 -p udp --dport 1701 -m policy --dir in --pol ipsec -j ACCEPT
 iptables -I INPUT 6 -p udp --dport 1701 -j DROP
+else
+iptables -I INPUT 1 -p udp --dport 1701 -j ACCEPT
+iptables -I INPUT 2 -m conntrack --ctstate INVALID -j DROP
+iptables -I INPUT 3 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -I INPUT 4 -p udp -m multiport --dports 500,4500 -j ACCEPT
+iptables -I INPUT 5 -p udp --dport 1701 -m policy --dir in --pol ipsec -j ACCEPT
+fi
+
 iptables -I FORWARD 1 -m conntrack --ctstate INVALID -j DROP
 iptables -I FORWARD 2 -i eth+ -o ppp+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -I FORWARD 3 -i ppp+ -o eth+ -j ACCEPT
@@ -342,10 +360,11 @@ IPsec VPN server is now ready for use!
 
 Connect to your new VPN with these details:
 
-Server IP: $PUBLIC_IP
+Server External IP: $PUBLIC_IP
 IPsec PSK: $VPN_IPSEC_PSK
 Username: $VPN_USER
 Password: $VPN_PASSWORD
+Encrypt: $L2TP_ENCRYPT
 EOF
 
 if [ -n "$VPN_ADDL_USERS" ] && [ -n "$VPN_ADDL_PASSWORDS" ]; then
@@ -381,5 +400,5 @@ EOF
 mkdir -p /run/pluto /var/run/pluto /var/run/xl2tpd
 rm -f /run/pluto/pluto.pid /var/run/pluto/pluto.pid /var/run/xl2tpd.pid
 
-/usr/local/sbin/ipsec start
+[ "$L2TP_ENCRYPT" = "Y" ] && /usr/local/sbin/ipsec start
 exec /usr/sbin/xl2tpd -D -c /etc/xl2tpd/xl2tpd.conf
